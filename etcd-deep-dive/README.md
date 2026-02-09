@@ -198,6 +198,41 @@ etcdctl get /registry/configmaps/default/my-cm -w json | jq
 }
 ```
 
+**What's Encoded in the Value?**
+
+The `value` field contains the **complete Kubernetes object** serialized as protobuf:
+
+```yaml
+# For a ConfigMap, the entire object is encoded:
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: my-cm
+  namespace: default
+  uid: abc-123
+  resourceVersion: "1234"        # ← This IS the mod_revision!
+  labels: {...}
+  annotations: {...}
+data:
+  app.properties: "server.port=8080"
+  config.json: '{"replicas": 3}'
+
+# For a Pod: metadata + spec + status (phase, podIP, conditions, etc.)
+# For Custom Resource: metadata + spec + status (your operator's data)
+```
+
+**Everything is stored:**
+- ✅ metadata (name, namespace, uid, resourceVersion, labels, annotations, finalizers)
+- ✅ spec (your desired state - replicas, image, volumes, etc.)
+- ✅ status (current state - conditions, phase, observed generation)
+- ✅ All nested objects (containers, env vars, everything!)
+
+**Key insight:** `metadata.resourceVersion` in Kubernetes **equals** `mod_revision` in etcd!
+
+**Why protobuf?** Smaller (30-50% vs JSON), faster, typed, backward compatible.
+
+**To view decoded:** Use `kubectl get <resource> -o yaml` (don't decode protobuf directly).
+
 **Why Maintain This Metadata?**
 - **MVCC**: Keep history of all changes
 - **Watches**: Notify clients with revision numbers
