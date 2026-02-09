@@ -7,6 +7,7 @@ Comprehensive resources for understanding how etcd works in your Kubernetes clus
 - [Quick Start](#-quick-start) - Get started in 30 seconds
 - [Common Commands](#-common-commands) - etcd-explorer.sh usage
 - [Understanding etcd](#-understanding-etcd) - Core concepts
+  - [Data Structure](#how-etcd-stores-data) - Key-value model with metadata
   - [Revision System Deep Dive](#deep-dive-etcds-revision-system) - Counters explained
   - [Update Mechanism](#what-happens-during-an-update) - Step-by-step trace
   - [MVCC in Action](#mvcc-in-action) - Time travel and history
@@ -32,6 +33,7 @@ Comprehensive resources for understanding how etcd works in your Kubernetes clus
 
 This guide covers:
 - ✅ **etcd fundamentals** - How Kubernetes stores all its state
+- ✅ **Data structure** - Key-value model with metadata (create_revision, mod_revision, version)
 - ✅ **Revision system** - Understanding version counters and MVCC
 - ✅ **Direct access** - Using etcdctl for advanced debugging
 - ✅ **Operator integration** - How your custom operators interact with etcd
@@ -94,6 +96,114 @@ kubectl patch configmapapp my-nginx-app -p '{"spec":{"replicas":5}}'
 ### Deep Dive: etcd's Revision System
 
 etcd uses a sophisticated versioning system to track every change in the cluster. Understanding this is crucial for debugging and monitoring.
+
+#### How etcd Stores Data
+
+At its core, etcd is a **key-value store** with metadata. Let's understand the actual data structure:
+
+**Conceptual Model (What You Think):**
+```python
+etcd = {
+  "/registry/pods/default/nginx": "<protobuf-data>",
+  "/registry/configmaps/default/my-cm": "<protobuf-data>",
+  "/registry/demo.mycompany.com/configmapapps/default/my-app": "<protobuf-data>"
+}
+```
+
+**Actual Storage (What etcd Maintains):**
+
+etcd maintains three separate but linked pieces of information:
+
+```python
+# 1. Primary data structure (the core key-value pair)
+data = {
+  "key": "/registry/pods/default/nginx",
+  "value": "<protobuf-data>"
+}
+
+# 2. Metadata maintained separately (but linked to the key)
+metadata = {
+  "create_revision": 1000,    # Cluster revision when key was created
+  "mod_revision": 1234,       # Cluster revision when key was last modified
+  "version": 3,               # How many times this key has been updated
+  "lease": 0                  # TTL lease ID (0 = no expiration)
+}
+
+# 3. Global cluster state (shared across all keys)
+cluster = {
+  "current_revision": 5000    # Current global revision counter
+}
+```
+
+**Combined View (What You Get):**
+```python
+# When you query a key, etcd returns everything together:
+{
+  "key": "/registry/demo.mycompany.com/configmapapps/default/my-app",
+  "value": "<protobuf-encoded-kubernetes-object>",
+  "create_revision": 1000,
+  "mod_revision": 1234,
+  "version": 3,
+  "lease": 0
+}
+```
+
+**Visual Representation:**
+```
+┌──────────────────────────────────┬──────────────────┬────────────┬──────────────┬─────────┐
+│ Key (Primary Index)              │ Value            │ CreateRev  │ ModRevision  │ Version │
+├──────────────────────────────────┼──────────────────┼────────────┼──────────────┼─────────┤
+│ /registry/pods/default/nginx     │ <protobuf-data>  │ 1000       │ 1234         │ 3       │
+│ /registry/configmaps/default/cm  │ <protobuf-data>  │ 2000       │ 2500         │ 1       │
+│ /registry/demo.../my-app         │ <protobuf-data>  │ 3000       │ 4000         │ 5       │
+└──────────────────────────────────┴──────────────────┴────────────┴──────────────┴─────────┘
+```
+
+**How Fetching Works:**
+```bash
+# You request: GET /registry/pods/default/nginx
+# etcd does:
+1. Hash table lookup by key (O(1) - instant!)
+2. Retrieve value: "<protobuf-data>"
+3. Also get associated metadata from indexes
+4. Return everything together
+```
+
+**Simple Output Format:**
+```bash
+etcdctl get /registry/configmaps/default/my-cm
+
+# Returns:
+/registry/configmaps/default/my-cm    # ← Key
+k8s...binary data...                   # ← Value
+```
+
+**Detailed Output Format (JSON with metadata):**
+```bash
+etcdctl get /registry/configmaps/default/my-cm -w json | jq
+
+# Returns:
+{
+  "header": {
+    "cluster_id": 14841639068965178418,
+    "revision": 5000                     # ← Global cluster revision
+  },
+  "kvs": [{
+    "key": "L3JlZ2lzdHJ5L...",          # ← Base64 encoded key
+    "value": "azhzAAoPCg...",            # ← Base64 encoded value
+    "create_revision": 1000,             # ← When created
+    "mod_revision": 1234,                # ← When last modified
+    "version": 3                         # ← Update count
+  }]
+}
+```
+
+**Why Maintain This Metadata?**
+- **MVCC**: Keep history of all changes
+- **Watches**: Notify clients with revision numbers
+- **Consistency**: Prevent race conditions with version checks
+- **Time Travel**: Query past revisions (`--rev=1000`)
+- **Debugging**: Audit trail of changes
 
 #### The Three Counters
 
@@ -248,6 +358,62 @@ ModRevision: 1000, Version: 5
 # You might see it existed in the past
 ```
 
+#### Viewing the Complete Data Structure
+
+Want to see the full data structure with all metadata? Here's how:
+
+```bash
+# Get a key with full metadata in JSON format
+kubectl exec -n kube-system etcd-minikube -- etcdctl \
+  --cacert=/var/lib/minikube/certs/etcd/ca.crt \
+  --cert=/var/lib/minikube/certs/etcd/server.crt \
+  --key=/var/lib/minikube/certs/etcd/server.key \
+  --endpoints=https://127.0.0.1:2379 \
+  get /registry/configmaps/default/my-cm -w json | jq
+
+# Pretty print just the important fields
+kubectl exec -n kube-system etcd-minikube -- etcdctl \
+  --cacert=/var/lib/minikube/certs/etcd/ca.crt \
+  --cert=/var/lib/minikube/certs/etcd/server.crt \
+  --key=/var/lib/minikube/certs/etcd/server.key \
+  --endpoints=https://127.0.0.1:2379 \
+  get /registry/configmaps/default/my-cm -w json | jq '{
+    key: .kvs[0].key | @base64d,
+    create_revision: .kvs[0].create_revision,
+    mod_revision: .kvs[0].mod_revision,
+    version: .kvs[0].version,
+    lease: .kvs[0].lease,
+    current_cluster_revision: .header.revision
+  }'
+
+# Example output:
+{
+  "key": "/registry/configmaps/default/my-cm",
+  "create_revision": 1000,      # Created at cluster revision 1000
+  "mod_revision": 1234,         # Last modified at cluster revision 1234
+  "version": 3,                 # Updated 3 times total
+  "lease": 0,                   # No expiration
+  "current_cluster_revision": 5000  # Cluster is now at revision 5000
+}
+```
+
+**Timeline Visualization:**
+```
+Cluster Revision Timeline:
+─────────────────────────────────────────────────────────────>
+Rev 1000        Rev 1050        Rev 1234        Rev 5000 (now)
+   │               │               │               │
+   │               │               │               └─ Other operations
+   │               │               └─ UPDATE (version=3, mod_rev=1234)
+   │               └─ UPDATE (version=2, mod_rev=1050)
+   └─ CREATE (version=1, create_rev=1000, mod_rev=1000)
+
+Key: /registry/configmaps/default/my-cm
+  create_revision: 1000  ← Never changes
+  mod_revision: 1234     ← Updated to latest change
+  version: 3             ← Incremented with each update
+```
+
 ### How Your Operators Use etcd
 
 ```
@@ -320,19 +486,34 @@ kubectl exec -it -n kube-system $(kubectl get pods -n kube-system -l component=e
 
 ### Set etcdctl Environment Variables
 
-```bash
-# Inside etcd pod, set these variables
-export ETCDCTL_API=3
-export ETCDCTL_CACERT=/etc/kubernetes/pki/etcd/ca.crt
-export ETCDCTL_CERT=/etc/kubernetes/pki/etcd/server.crt
-export ETCDCTL_KEY=/etc/kubernetes/pki/etcd/server.key
-export ETCDCTL_ENDPOINTS=https://127.0.0.1:2379
+**Important:** etcd containers are minimal and don't include a shell (`bash` or `sh`), so you must run commands directly.
 
-# Or set them inline (if not in pod)
-alias etcdctl='kubectl exec -it -n kube-system <etcd-pod> -- etcdctl \
+**Certificate Paths by Environment:**
+- **Standard Kubernetes/kubeadm**: `/etc/kubernetes/pki/etcd/`
+- **Minikube**: `/var/lib/minikube/certs/etcd/`
+- **Kind**: Check with `kubectl describe pod -n kube-system etcd-*`
+
+**Find your certificate paths:**
+```bash
+# Check the etcd pod's command to see actual cert paths
+kubectl describe pod -n kube-system etcd-minikube | grep -E "cert-file|key-file|trusted-ca-file"
+```
+
+**For Standard Kubernetes:**
+```bash
+alias etcdctl='kubectl exec -n kube-system <etcd-pod> -- etcdctl \
   --cacert=/etc/kubernetes/pki/etcd/ca.crt \
   --cert=/etc/kubernetes/pki/etcd/server.crt \
   --key=/etc/kubernetes/pki/etcd/server.key \
+  --endpoints=https://127.0.0.1:2379'
+```
+
+**For Minikube:**
+```bash
+alias etcdctl='kubectl exec -n kube-system etcd-minikube -- etcdctl \
+  --cacert=/var/lib/minikube/certs/etcd/ca.crt \
+  --cert=/var/lib/minikube/certs/etcd/server.crt \
+  --key=/var/lib/minikube/certs/etcd/server.key \
   --endpoints=https://127.0.0.1:2379'
 ```
 
@@ -737,13 +918,22 @@ etcdctl alarm list                        # Check alarms
 
 ### Environment Setup
 
+**Standard Kubernetes Alias:**
 ```bash
-# Copy-paste this block when accessing etcd pod:
-export ETCDCTL_API=3
-export ETCDCTL_CACERT=/etc/kubernetes/pki/etcd/ca.crt
-export ETCDCTL_CERT=/etc/kubernetes/pki/etcd/server.crt
-export ETCDCTL_KEY=/etc/kubernetes/pki/etcd/server.key
-export ETCDCTL_ENDPOINTS=https://127.0.0.1:2379
+alias etcdctl='kubectl exec -n kube-system <etcd-pod> -- etcdctl \
+  --cacert=/etc/kubernetes/pki/etcd/ca.crt \
+  --cert=/etc/kubernetes/pki/etcd/server.crt \
+  --key=/etc/kubernetes/pki/etcd/server.key \
+  --endpoints=https://127.0.0.1:2379'
+```
+
+**Minikube Alias:**
+```bash
+alias etcdctl='kubectl exec -n kube-system etcd-minikube -- etcdctl \
+  --cacert=/var/lib/minikube/certs/etcd/ca.crt \
+  --cert=/var/lib/minikube/certs/etcd/server.crt \
+  --key=/var/lib/minikube/certs/etcd/server.key \
+  --endpoints=https://127.0.0.1:2379'
 ```
 
 ### One-Liners
